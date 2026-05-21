@@ -1,0 +1,43 @@
+# cronwatch example configuration
+# Copy to cronwatch.yaml and adjust to your environment.
+
+# How often cronwatch checks for missed jobs (default: 1m)
+check_interval: 1m
+
+jobs:
+  # Daily database backup — must run within 15 minutes
+  - name: db-backup
+    schedule: "0 2 * * *"   # every day at 02:00
+    timeout: 15m
+    alert_on:
+      - missed
+      - failed
+
+  # Hourly cache warm-up
+  - name: cache-warmup
+    schedule: "0 * * * *"   # every hour
+    timeout: 5m
+    alert_on:
+      - missed
+
+  # Weekly report generation
+  - name: weekly-report
+    schedule: "0 8 * * 1"   # every Monday at 08:00
+    timeout: 30m
+    alert_on:
+      - missed
+      - failed
+
+alerts:
+  # Email alerting via SMTP
+  email:
+    smtp_host: smtp.example.com
+    smtp_port: 587
+    from: cronwatch@example.com
+    to:
+      - ops@example.com
+      - oncall@example.com
+
+  # Slack webhook alerting
+  slack:
+    webhook_url: https://hooks.slack.com/services/YOUR/WEBHOOK/URL
