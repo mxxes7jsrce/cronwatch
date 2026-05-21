@@ -1,15 +1,8 @@
-// Package watcher provides functionality for parsing and tailing system cron
-// logs (or a configurable log file) to detect job execution events.
-//
-// It scans log lines for patterns matching configured job identifiers and
-// reports successes or failures back to the state store via callbacks.
 package watcher
 
 import (
-	"bufio"
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 	"time"
@@ -17,123 +10,84 @@ import (
 	"github.com/user/cronwatch/internal/config"
 )
 
-// Event represents a detected cron job execution event parsed from a log line.
-type Event struct {
-	// JobName is the name of the job as defined in the config.
-	JobName string
-	// Success indicates whether the job completed without error.
-	Success bool
-	// Timestamp is when the event was detected.
-	Timestamp time.Time
-	// RawLine is the original log line that triggered the event.
-	RawLine string
-}
+const maxReadBytes = 32 * 1024 // 32 KB tail read limit
 
-// Handler is a callback invoked when a job execution event is detected.
-type Handler func(evt Event)
-
-// Watcher tails a log file and emits Events for configured jobs.
+// Watcher checks a cron job's log file for signs of failure.
 type Watcher struct {
-	cfg     *config.Config
-	logPath string
-	handler Handler
+	job     config.Job
+	jobName string
 }
 
-// New creates a new Watcher that reads from logPath and calls handler for
-// each detected job event. logPath is typically /var/log/syslog or
-// /var/log/cron depending on the host OS.
-func New(cfg *config.Config, logPath string, handler Handler) (*Watcher, error) {
-	if cfg == nil {
-		return nil, fmt.Errorf("watcher: config must not be nil")
+// New creates a new Watcher for the given job configuration.
+func New(job config.Job, jobName string) (*Watcher, error) {
+	if jobName == "" {
+		return nil, fmt.Errorf("watcher: jobName must not be empty")
 	}
-	if logPath == "" {
-		return nil, fmt.Errorf("watcher: logPath must not be empty")
+	return &Watcher{job: job, jobName: jobName}, nil
+}
+
+// Check reads the configured log file and returns a Result indicating
+// whether the job appears to have succeeded or failed.
+func (w *Watcher) Check(ctx context.Context) (Result, error) {
+	select {
+	case <-ctx.Done():
+		return Result{}, ctx.Err()
+	default:
 	}
-	if handler == nil {
-		return nil, fmt.Errorf("watcher: handler must not be nil")
+
+	output, err := w.readLog()
+	if err != nil {
+		return Result{}, fmt.Errorf("watcher %q: %w", w.jobName, err)
 	}
-	return &Watcher{
-		cfg:     cfg,
-		logPath: logPath,
-		handler: handler,
+
+	kw := containsFailureKeyword(output, w.job.FailureKeywords)
+	return Result{
+		JobName:        w.jobName,
+		Success:        kw == "",
+		Output:         output,
+		MatchedKeyword: kw,
+		CheckedAt:      time.Now().UTC(),
 	}, nil
 }
 
-// Run opens the log file, seeks to the end, and continuously reads new lines
-// until ctx is cancelled. It calls the handler for each matched event.
-//
-// Run blocks until the context is done.
-func (w *Watcher) Run(ctx context.Context) error {
-	f, err := os.Open(w.logPath)
+// readLog reads up to maxReadBytes from the tail of the log file.
+func (w *Watcher) readLog() (string, error) {
+	f, err := os.Open(w.job.LogFile)
 	if err != nil {
-		return fmt.Errorf("watcher: open log file %q: %w", w.logPath, err)
+		return "", fmt.Errorf("open log file: %w", err)
 	}
 	defer f.Close()
 
-	// Seek to end so we only process new entries written after startup.
-	if _, err := f.Seek(0, io.SeekEnd); err != nil {
-		return fmt.Errorf("watcher: seek log file: %w", err)
+	info, err := f.Stat()
+	if err != nil {
+		return "", fmt.Errorf("stat log file: %w", err)
 	}
 
-	reader := bufio.NewReader(f)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err != io.EOF {
-				return fmt.Errorf("watcher: read log file: %w", err)
-			}
-			// No new data yet — wait briefly before retrying.
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(500 * time.Millisecond):
-			}
-			continue
-		}
-
-		w.processLine(strings.TrimRight(line, "\n"))
+	size := info.Size()
+	offset := int64(0)
+	if size > maxReadBytes {
+		offset = size - maxReadBytes
 	}
+
+	if _, err := f.Seek(offset, 0); err != nil {
+		return "", fmt.Errorf("seek log file: %w", err)
+	}
+
+	buf := make([]byte, size-offset)
+	n, err := f.Read(buf)
+	if err != nil {
+		return "", fmt.Errorf("read log file: %w", err)
+	}
+	return string(buf[:n]), nil
 }
 
-// processLine checks the log line against each configured job's match pattern
-// and fires the handler if a match is found.
-func (w *Watcher) processLine(line string) {
-	for _, job := range w.cfg.Jobs {
-		if job.MatchPattern == "" {
-			continue
-		}
-		if !strings.Contains(line, job.MatchPattern) {
-			continue
-		}
-
-		// Determine success/failure by the absence of common error keywords.
-		success := !containsFailureKeyword(line)
-
-		w.handler(Event{
-			JobName:   job.Name,
-			Success:   success,
-			Timestamp: time.Now().UTC(),
-			RawLine:   line,
-		})
-	}
-}
-
-// containsFailureKeyword returns true if the log line contains any keyword
-// that typically indicates a job failure.
-func containsFailureKeyword(line string) bool {
-	keywords := []string{"error", "fail", "exit code", "killed", "terminated"}
-	lower := strings.ToLower(line)
+// containsFailureKeyword scans output for any of the provided keywords.
+// Returns the first matched keyword, or empty string if none found.
+func containsFailureKeyword(output string, keywords []string) string {
 	for _, kw := range keywords {
-		if strings.Contains(lower, kw) {
-			return true
+		if strings.Contains(output, kw) {
+			return kw
 		}
 	}
-	return false
+	return ""
 }
