@@ -87,3 +87,12 @@ func TestNewWebhookNotifier_DefaultTimeout(t *testing.T) {
 		t.Errorf("expected default timeout 10s, got %v", n.Timeout)
 	}
 }
+
+func TestWebhookNotifier_Send_InvalidURL(t *testing.T) {
+	// A notifier pointed at an invalid URL should return an error without panicking.
+	n := notify.NewWebhookNotifier("http://127.0.0.1:0", time.Second)
+	err := n.Send(notify.Alert{JobName: "test", AlertType: notify.AlertFailed})
+	if err == nil {
+		t.Fatal("expected error when sending to unreachable URL, got nil")
+	}
+}
