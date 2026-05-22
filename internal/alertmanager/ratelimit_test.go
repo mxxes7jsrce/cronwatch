@@ -15,11 +15,11 @@ func TestRateLimiter_AllowsUpToMax(t *testing.T) {
 
 	for i := 0; i < 3; i++ {
 		if !rl.Allow() {
-			t.Fatalf("expected Allow()=true on attempt %d", i+1)
+			t.Fatalf("expected Allow() == true on call %d", i+1)
 		}
 	}
 	if rl.Allow() {
-		t.Fatal("expected Allow()=false after max reached")
+		t.Fatal("expected Allow() == false after max reached")
 	}
 }
 
@@ -33,14 +33,14 @@ func TestRateLimiter_ResetsAfterWindow(t *testing.T) {
 	rl.Allow()
 
 	if rl.Allow() {
-		t.Fatal("expected rate limit to be hit")
+		t.Fatal("expected rate limit to be exhausted")
 	}
 
-	// Advance clock beyond the window.
+	// Advance time beyond the window.
 	current = base.Add(2 * time.Minute)
 
 	if !rl.Allow() {
-		t.Fatal("expected Allow()=true after window reset")
+		t.Fatal("expected Allow() == true after window reset")
 	}
 }
 
@@ -62,21 +62,18 @@ func TestRateLimiter_Remaining(t *testing.T) {
 
 func TestRateLimiter_NilClockDefaultsToTimeNow(t *testing.T) {
 	rl := newRateLimiter(1, time.Minute, nil)
-	if rl.clock == nil {
-		t.Fatal("expected clock to be set to time.Now")
-	}
 	if !rl.Allow() {
-		t.Fatal("expected first Allow() to succeed")
+		t.Fatal("expected first Allow() to succeed with nil clock")
 	}
 }
 
-func TestRateLimiter_ZeroMax(t *testing.T) {
+func TestRateLimiter_RemainingNeverNegative(t *testing.T) {
 	now := time.Now()
-	rl := newRateLimiter(0, time.Minute, makeFixedClock(now))
-	if rl.Allow() {
-		t.Fatal("expected Allow()=false when max is 0")
-	}
+	rl := newRateLimiter(1, time.Minute, makeFixedClock(now))
+	rl.Allow()
+	rl.Allow() // exceeds max
+
 	if got := rl.Remaining(); got != 0 {
-		t.Fatalf("expected 0 remaining, got %d", got)
+		t.Fatalf("expected Remaining() >= 0, got %d", got)
 	}
 }

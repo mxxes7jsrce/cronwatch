@@ -7,11 +7,11 @@ import (
 
 // rateLimiter enforces a maximum number of alerts per rolling time window.
 type rateLimiter struct {
-	mu       sync.Mutex
-	max      int
-	window   time.Duration
+	mu        sync.Mutex
+	max       int
+	window    time.Duration
 	timestamps []time.Time
-	clock    func() time.Time
+	clock     func() time.Time
 }
 
 func newRateLimiter(max int, window time.Duration, clock func() time.Time) *rateLimiter {
@@ -25,7 +25,7 @@ func newRateLimiter(max int, window time.Duration, clock func() time.Time) *rate
 	}
 }
 
-// Allow returns true if the alert is within the rate limit, recording the attempt.
+// Allow returns true if the alert is within the rate limit budget.
 func (r *rateLimiter) Allow() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -34,13 +34,13 @@ func (r *rateLimiter) Allow() bool {
 	cutoff := now.Add(-r.window)
 
 	// Evict timestamps outside the window.
-	valid := r.timestamps[:0]
+	active := r.timestamps[:0]
 	for _, t := range r.timestamps {
 		if t.After(cutoff) {
-			valid = append(valid, t)
+			active = append(active, t)
 		}
 	}
-	r.timestamps = valid
+	r.timestamps = active
 
 	if len(r.timestamps) >= r.max {
 		return false
@@ -50,7 +50,7 @@ func (r *rateLimiter) Allow() bool {
 	return true
 }
 
-// Remaining returns the number of alerts still allowed in the current window.
+// Remaining returns how many more alerts are allowed in the current window.
 func (r *rateLimiter) Remaining() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
