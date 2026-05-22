@@ -5,14 +5,13 @@ import (
 	"time"
 )
 
-// rateLimiter enforces a maximum number of alerts per window across all jobs.
-// It is used to prevent alert storms when many jobs fail simultaneously.
+// rateLimiter enforces a maximum number of alerts per rolling time window.
 type rateLimiter struct {
 	mu       sync.Mutex
 	max      int
 	window   time.Duration
+	timestamps []time.Time
 	clock    func() time.Time
-	buckets  []time.Time
 }
 
 func newRateLimiter(max int, window time.Duration, clock func() time.Time) *rateLimiter {
@@ -26,8 +25,7 @@ func newRateLimiter(max int, window time.Duration, clock func() time.Time) *rate
 	}
 }
 
-// Allow returns true if an alert may be sent, false if the rate limit is exceeded.
-// It prunes expired entries before checking.
+// Allow returns true if the alert is within the rate limit, recording the attempt.
 func (r *rateLimiter) Allow() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -35,20 +33,20 @@ func (r *rateLimiter) Allow() bool {
 	now := r.clock()
 	cutoff := now.Add(-r.window)
 
-	// Prune entries outside the window.
-	valid := r.buckets[:0]
-	for _, t := range r.buckets {
+	// Evict timestamps outside the window.
+	valid := r.timestamps[:0]
+	for _, t := range r.timestamps {
 		if t.After(cutoff) {
 			valid = append(valid, t)
 		}
 	}
-	r.buckets = valid
+	r.timestamps = valid
 
-	if len(r.buckets) >= r.max {
+	if len(r.timestamps) >= r.max {
 		return false
 	}
 
-	r.buckets = append(r.buckets, now)
+	r.timestamps = append(r.timestamps, now)
 	return true
 }
 
@@ -59,12 +57,14 @@ func (r *rateLimiter) Remaining() int {
 
 	now := r.clock()
 	cutoff := now.Add(-r.window)
+
 	count := 0
-	for _, t := range r.buckets {
+	for _, t := range r.timestamps {
 		if t.After(cutoff) {
 			count++
 		}
 	}
+
 	remaining := r.max - count
 	if remaining < 0 {
 		return 0
