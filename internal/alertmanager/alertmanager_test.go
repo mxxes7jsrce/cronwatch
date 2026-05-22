@@ -1,78 +1,90 @@
-package alertmanager_test
+package alertmanager
 
 import (
 	"context"
-	"sync"
 	"testing"
 	"time"
 
-	"github.com/cronwatch/internal/alertmanager"
 	"github.com/cronwatch/internal/config"
 	"github.com/cronwatch/internal/watcher"
 )
 
+// mockNotifier records calls to Send.
 type mockNotifier struct {
-	mu     sync.Mutex
-	calls  []string
-	err    error
+	calls []string
+	err   error
 }
 
 func (m *mockNotifier) Send(_ context.Context, msg string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.calls = append(m.calls, msg)
 	return m.err
 }
 
-func (m *mockNotifier) CallCount() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return len(m.calls)
+var baseJobCfg = config.Job{
+	Name:    "backup",
+	LogPath: "/var/log/backup.log",
 }
 
-func baseJobCfg(name string) config.Job {
-	return config.Job{
-		Name:          name,
-		Schedule:      "@hourly",
-		LogFile:       "/var/log/" + name + ".log",
-		Cooldown:      60,
-		FailKeywords:  []string{"error"},
-	}
+func baseCfg(cooldown int) config.Config {
+	return config.Config{AlertCooldownMinutes: cooldown}
 }
 
 func TestAlertManager_SendsOnFailure(t *testing.T) {
 	n := &mockNotifier{}
-	am := alertmanager.New(n, 0)
+	am := newWithClock(baseCfg(5), n, time.Now)
 
-	res := watcher.Result{Job: baseJobCfg("backup"), Failed: true, Reason: "keyword: error"}
-	am.Handle(context.Background(), res)
+	result := watcher.Result{Healthy: false, MatchedKeyword: "error"}
+	am.Evaluate(context.Background(), baseJobCfg, result)
 
-	if n.CallCount() != 1 {
-		t.Fatalf("expected 1 alert, got %d", n.CallCount())
+	if len(n.calls) != 1 {
+		t.Fatalf("expected 1 alert, got %d", len(n.calls))
+	}
+	if want := "[cronwatch] FAILURE"; len(n.calls[0]) == 0 {
+		t.Errorf("expected message containing %q, got empty", want)
 	}
 }
 
 func TestAlertManager_DeduplicatesWithinCooldown(t *testing.T) {
 	n := &mockNotifier{}
-	am := alertmanager.New(n, 5*time.Minute)
+	now := time.Now()
+	clock := func() time.Time { return now }
+	am := newWithClock(baseCfg(10), n, clock)
 
-	res := watcher.Result{Job: baseJobCfg("backup"), Failed: true, Reason: "keyword: error"}
-	am.Handle(context.Background(), res)
-	am.Handle(context.Background(), res)
+	result := watcher.Result{Healthy: false, MatchedKeyword: "error"}
+	am.Evaluate(context.Background(), baseJobCfg, result)
+	am.Evaluate(context.Background(), baseJobCfg, result)
 
-	if n.CallCount() != 1 {
-		t.Fatalf("expected 1 alert due to dedup, got %d", n.CallCount())
+	if len(n.calls) != 1 {
+		t.Errorf("expected 1 alert due to dedup, got %d", len(n.calls))
 	}
 }
 
-func TestAlertManager_NoAlertOnSuccess(t *testing.T) {
+func TestAlertManager_AllowsAlertAfterCooldown(t *testing.T) {
 	n := &mockNotifier{}
-	am := alertmanager.New(n, 0)
+	now := time.Now()
+	clock := func() time.Time { return now }
+	am := newWithClock(baseCfg(5), n, clock)
 
-	res := watcher.Result{Job: baseJobCfg("backup"), Failed: false}
-	am.Handle(context.Background(), res)
+	result := watcher.Result{Healthy: false, MatchedKeyword: "error"}
+	am.Evaluate(context.Background(), baseJobCfg, result)
 
-	if n.CallCount() != 0 {
-		t.Fatalf("expected 0 alerts on success, got %d", n.CallCount())
+	// Advance clock past cooldown.
+	now = now.Add(6 * time.Minute)
+	am.Evaluate(context.Background(), baseJobCfg, result)
+
+	if len(n.calls) != 2 {
+		t.Errorf("expected 2 alerts after cooldown, got %d", len(n.calls))
+	}
+}
+
+func TestAlertManager_SkipsHealthyResult(t *testing.T) {
+	n := &mockNotifier{}
+	am := newWithClock(baseCfg(5), n, time.Now)
+
+	result := watcher.Result{Healthy: true}
+	am.Evaluate(context.Background(), baseJobCfg, result)
+
+	if len(n.calls) != 0 {
+		t.Errorf("expected no alerts for healthy result, got %d", len(n.calls))
 	}
 }
