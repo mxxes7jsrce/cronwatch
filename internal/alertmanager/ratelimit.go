@@ -5,53 +5,55 @@ import (
 	"time"
 )
 
-// rateLimiter enforces a maximum number of alerts per rolling time window.
+// rateLimiter enforces a maximum number of alerts per time window per job.
 type rateLimiter struct {
-	mu        sync.Mutex
-	max       int
-	window    time.Duration
-	timestamps []time.Time
-	clock     func() time.Time
+	mu      sync.Mutex
+	counts  map[string][]time.Time
+	maxRate int
+	window  time.Duration
+	clock   func() time.Time
 }
 
-func newRateLimiter(max int, window time.Duration, clock func() time.Time) *rateLimiter {
+func newRateLimiter(maxRate int, window time.Duration, clock func() time.Time) *rateLimiter {
 	if clock == nil {
 		clock = time.Now
 	}
 	return &rateLimiter{
-		max:    max,
-		window: window,
-		clock:  clock,
+		counts:  make(map[string][]time.Time),
+		maxRate: maxRate,
+		window:  window,
+		clock:   clock,
 	}
 }
 
-// Allow returns true if the alert is within the rate limit budget.
-func (r *rateLimiter) Allow() bool {
+// Allow returns true if the alert for the given key is within the rate limit.
+func (r *rateLimiter) Allow(key string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	now := r.clock()
 	cutoff := now.Add(-r.window)
 
-	// Evict timestamps outside the window.
-	active := r.timestamps[:0]
-	for _, t := range r.timestamps {
+	times := r.counts[key]
+	filtered := times[:0]
+	for _, t := range times {
 		if t.After(cutoff) {
-			active = append(active, t)
+			filtered = append(filtered, t)
 		}
 	}
-	r.timestamps = active
 
-	if len(r.timestamps) >= r.max {
+	if len(filtered) >= r.maxRate {
+		r.counts[key] = filtered
 		return false
 	}
 
-	r.timestamps = append(r.timestamps, now)
+	r.counts[key] = append(filtered, now)
 	return true
 }
 
-// Remaining returns how many more alerts are allowed in the current window.
-func (r *rateLimiter) Remaining() int {
+// Remaining returns how many more alerts are allowed for the given key
+// within the current window.
+func (r *rateLimiter) Remaining(key string) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -59,13 +61,13 @@ func (r *rateLimiter) Remaining() int {
 	cutoff := now.Add(-r.window)
 
 	count := 0
-	for _, t := range r.timestamps {
+	for _, t := range r.counts[key] {
 		if t.After(cutoff) {
 			count++
 		}
 	}
 
-	remaining := r.max - count
+	remaining := r.maxRate - count
 	if remaining < 0 {
 		return 0
 	}
