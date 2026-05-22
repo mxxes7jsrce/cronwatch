@@ -1,6 +1,4 @@
-// Package alertmanager coordinates the evaluation of watcher results
-// and dispatches notifications when a cron job is missed or has failed.
-// It acts as the glue between the watcher, state store, and notifier.
+// Package alertmanager coordinates alert dispatch with deduplication.
 package alertmanager
 
 import (
@@ -9,95 +7,70 @@ import (
 	"log"
 	"time"
 
-	"github.com/yourorg/cronwatch/internal/config"
-	"github.com/yourorg/cronwatch/internal/notify"
-	"github.com/yourorg/cronwatch/internal/state"
-	"github.com/yourorg/cronwatch/internal/watcher"
+	"github.com/cronwatch/internal/watcher"
 )
 
-// Notifier is the interface used to send alert messages.
+// Notifier is the interface for sending alert messages.
 type Notifier interface {
-	Send(ctx context.Context, msg string) error
+	Send(ctx context.Context, message string) error
 }
 
-// AlertManager evaluates watcher results and triggers alerts as needed.
-type AlertManager struct {
-	cfg      *config.Config
-	store    *state.Store
+// Manager handles alert routing and deduplication.
+type Manager struct {
 	notifier Notifier
-	watcher  *watcher.Watcher
+	dedup    *dedupStore
 }
 
-// New creates a new AlertManager wired with the provided dependencies.
-func New(cfg *config.Config, store *state.Store, n Notifier, w *watcher.Watcher) *AlertManager {
-	return &AlertManager{
-		cfg:      cfg,
-		store:    store,
+// New creates a new Manager with the given notifier and cooldown duration.
+// A cooldown of 0 disables deduplication.
+func New(n Notifier, cooldown time.Duration) *Manager {
+	return &Manager{
 		notifier: n,
-		watcher:  w,
+		dedup:    newDedupStore(cooldown),
 	}
 }
 
-// Evaluate checks all configured jobs, updates state, and sends alerts
-// for any job that is missed or has failed. It is intended to be called
-// on each scheduler tick.
-func (am *AlertManager) Evaluate(ctx context.Context) {
-	for _, job := range am.cfg.Jobs {
-		result, err := am.watcher.Check(ctx, job)
-		if err != nil {
-			log.Printf("[alertmanager] error checking job %q: %v", job.Name, err)
-			continue
-		}
-
-		am.handleResult(ctx, job, result)
-	}
-}
-
-// handleResult updates state and dispatches an alert based on the watcher result.
-func (am *AlertManager) handleResult(ctx context.Context, job config.Job, result watcher.Result) {
-	switch {
-	case result.Missed:
-		state.RecordMissed(am.store, job.Name)
-		msg := am.formatAlert(job.Name, "missed", "no log activity detected within the expected window")
-		am.sendAlert(ctx, job.Name, msg)
-
-	case result.Failed:
-		state.RecordFailure(am.store, job.Name)
-		msg := am.formatAlert(job.Name, "failed", result.Reason)
-		am.sendAlert(ctx, job.Name, msg)
-
-	default:
-		state.RecordSuccess(am.store, job.Name)
-		log.Printf("[alertmanager] job %q is healthy", job.Name)
-	}
-}
-
-// sendAlert dispatches a notification message, logging any delivery error.
-func (am *AlertManager) sendAlert(ctx context.Context, jobName, msg string) {
-	if err := am.notifier.Send(ctx, msg); err != nil {
-		log.Printf("[alertmanager] failed to send alert for job %q: %v", jobName, err)
+// Handle processes a watcher result and sends an alert if warranted.
+func (m *Manager) Handle(ctx context.Context, res watcher.Result) {
+	if !res.Failed && !res.Missed {
 		return
 	}
-	log.Printf("[alertmanager] alert sent for job %q", jobName)
+
+	kind := alertKind(res)
+	if !m.dedup.allow(res.Job.Name, kind) {
+		log.Printf("[alertmanager] suppressed duplicate alert job=%s kind=%s", res.Job.Name, kind)
+		return
+	}
+
+	msg := formatMessage(res)
+	if err := m.notifier.Send(ctx, msg); err != nil {
+		log.Printf("[alertmanager] failed to send alert for job=%s: %v", res.Job.Name, err)
+		// roll back dedup entry so the next attempt is not suppressed
+		m.dedup.reset(res.Job.Name, kind)
+	}
 }
 
-// formatAlert builds a human-readable alert string for a job event.
-func (am *AlertManager) formatAlert(jobName, status, reason string) string {
+// HandleBatch processes multiple results.
+func (m *Manager) HandleBatch(ctx context.Context, results []watcher.Result) {
+	for _, r := range results {
+		m.Handle(ctx, r)
+	}
+}
+
+func alertKind(res watcher.Result) string {
+	if res.Missed {
+		return "missed"
+	}
+	return "failed"
+}
+
+func formatMessage(res watcher.Result) string {
+	kind := alertKind(res)
 	return fmt.Sprintf(
 		"[cronwatch] job %q %s at %s — %s",
-		jobName,
-		status,
+		res.Job.Name,
+		kind,
 		time.Now().UTC().Format(time.RFC3339),
-		reason,
+		res.Reason,
 	)
-}
-
-// NewFromConfig constructs an AlertManager using a webhook notifier derived
-// from the provided configuration.
-func NewFromConfig(cfg *config.Config, store *state.Store, w *watcher.Watcher) (*AlertManager, error) {
-	n, err := notify.NewWebhookNotifier(cfg.Alerting.WebhookURL)
-	if err != nil {
-		return nil, fmt.Errorf("alertmanager: failed to create notifier: %w", err)
-	}
-	return New(cfg, store, n, w), nil
 }

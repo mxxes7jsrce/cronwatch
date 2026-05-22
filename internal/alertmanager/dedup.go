@@ -5,52 +5,47 @@ import (
 	"time"
 )
 
-// dedupKey uniquely identifies an alert by job name and alert kind.
 type dedupKey struct {
-	JobName string
-	Kind    string
+	job  string
+	kind string
 }
 
-// dedupStore tracks the last time an alert was sent for each key,
-// enabling cooldown-based deduplication.
 type dedupStore struct {
-	mu      sync.Mutex
-	records map[dedupKey]time.Time
-	clock   func() time.Time
+	mu       sync.Mutex
+	cooldown time.Duration
+	last     map[dedupKey]time.Time
+	clock    func() time.Time
 }
 
-func newDedupStore(clock func() time.Time) *dedupStore {
-	if clock == nil {
-		clock = time.Now
-	}
+func newDedupStore(cooldown time.Duration) *dedupStore {
 	return &dedupStore{
-		records: make(map[dedupKey]time.Time),
-		clock:   clock,
+		cooldown: cooldown,
+		last:     make(map[dedupKey]time.Time),
+		clock:    time.Now,
 	}
 }
 
-// allow returns true if the alert should be sent (i.e. not within cooldown).
-// If allowed, it records the current time for the key.
-func (d *dedupStore) allow(jobName, kind string, cooldown time.Duration) bool {
+// allow returns true if an alert for (job, kind) should be sent.
+// It records the current time as the last alert time when returning true.
+func (d *dedupStore) allow(job, kind string) bool {
+	if d.cooldown == 0 {
+		return true
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	key := dedupKey{JobName: jobName, Kind: kind}
+	k := dedupKey{job: job, kind: kind}
 	now := d.clock()
-
-	if last, ok := d.records[key]; ok {
-		if now.Sub(last) < cooldown {
-			return false
-		}
+	if t, ok := d.last[k]; ok && now.Sub(t) < d.cooldown {
+		return false
 	}
-
-	d.records[key] = now
+	d.last[k] = now
 	return true
 }
 
-// reset clears the dedup record for a specific job and kind.
-func (d *dedupStore) reset(jobName, kind string) {
+// reset removes the dedup entry so the next alert is not suppressed.
+func (d *dedupStore) reset(job, kind string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	delete(d.records, dedupKey{JobName: jobName, Kind: kind})
+	delete(d.last, dedupKey{job: job, kind: kind})
 }
