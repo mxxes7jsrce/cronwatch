@@ -66,6 +66,22 @@ func TestTouch_UnknownJobReturnsFalse(t *testing.T) {
 	}
 }
 
+func TestTouch_MultipleUpdatesLastSeen(t *testing.T) {
+	first := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
+	second := time.Date(2024, 1, 1, 13, 0, 0, 0, time.UTC)
+
+	reg := newWithClock(baseJobs(), fixedNow(first))
+	reg.Touch("backup")
+
+	reg.now = fixedNow(second)
+	reg.Touch("backup")
+
+	e, _ := reg.Get("backup")
+	if !e.LastSeen.Equal(second) {
+		t.Errorf("expected LastSeen to be updated to %v, got %v", second, e.LastSeen)
+	}
+}
+
 func TestStale_ReturnsOverdueJobs(t *testing.T) {
 	base := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
 	reg := newWithClock(baseJobs(), fixedNow(base))
